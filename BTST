@@ -1,0 +1,733 @@
+// © jayeshboradia
+//@version=6
+
+indicator('BTST By ANT', overlay = true, max_labels_count=500)
+
+// ═══════════════════════════════════════════════════════════════════════════════════
+// CONFLUENCE SETTINGS
+// ═══════════════════════════════════════════════════════════════════════════════════
+
+// REMOVED: High/Low Confluence Filter
+
+// VWAP Confluence
+bool enable_vwap_confluence = input.bool(true, "Enable VWAP Confluence Filter", group="Confluence Settings", tooltip="Gap Up requires price above VWAP, Gap Down requires price below VWAP")
+
+// EMA Confluence
+bool enable_ema_confluence = input.bool(true, "Enable EMA Confluence Filter", group="Confluence Settings", tooltip="Gap Up requires price above EMA, Gap Down requires price below EMA")
+int ema_length = input.int(50, "EMA Length", minval=1, maxval=200, group="Confluence Settings", tooltip="Length of EMA for confluence filter")
+
+// NEW: Volume Confluence
+bool enable_volume_confluence = input.bool(true, "Enable Volume Confluence Filter", group="Confluence Settings", tooltip="Requires volume to be above average by specified multiplier")
+int volume_length = input.int(18, "Volume Average Length", minval=1, maxval=200, group="Confluence Settings", tooltip="Period for calculating average volume")
+float volume_multiplier = input.float(1.3, "Volume Multiplier", minval=0.1, maxval=10.0, step=0.1, group="Confluence Settings", tooltip="Current volume must be this many times the average")
+
+// ═══════════════════════════════════════════════════════════════════════════════════
+// PERFORMANCE TABLE SETTINGS
+// ═══════════════════════════════════════════════════════════════════════════════════
+
+bool show_performance_table = input.bool(true, "Show Performance Table", group="Performance Table")
+string table_position = input.string("top_right", "Table Position", options=["top_left", "top_center", "top_right", "middle_left", "middle_center", "middle_right", "bottom_left", "bottom_center", "bottom_right"], group="Performance Table")
+string user_login = input.string("tradeskishor-oss", "User Login", group="Performance Table")
+int performance_months = input.int(24, "Performance History (Months)", minval=1, maxval=240, group="Performance Table", tooltip="Number of months to display in performance table (default: 12)")
+
+// Trading Settings
+float target_percent = input.float(1.8, "Target %", minval=0.1, maxval=20.0, step=0.1, group="Trading Settings", tooltip="Target profit percentage for next day")
+float sl_percent = input.float(1.5, "Stop Loss %", minval=0.1, maxval=20.0, step=0.1, group="Trading Settings", tooltip="Stop loss percentage for next day")
+float option_multiplier = input.float(0.6, "Option Points Multiplier", minval=0.1, maxval=2.0, step=0.1, group="Trading Settings", tooltip="Multiplier for option points calculation")
+float lot_size = input.float(525, "Lot Size / PNL Multiplier", minval=1, maxval=10000, step=25, group="Trading Settings", tooltip="Multiplier for PNL calculation in ₹")
+
+// ═══════════════════════════════════════════════════════════════════════════════════
+// CALCULATE VWAP, EMA, AND VOLUME
+// ═══════════════════════════════════════════════════════════════════════════════════
+
+// VWAP Calculation
+float vwap_value = ta.vwap(close)
+
+// EMA Calculation
+float ema_value = ta.ema(close, ema_length)
+
+// Volume Calculation
+float avg_volume = ta.sma(volume, volume_length)
+float volume_threshold = avg_volume * volume_multiplier
+
+// Plot VWAP and EMA on chart
+plot(enable_vwap_confluence ? vwap_value : na, "VWAP", color=color.new(color.orange, 0), linewidth=2)
+plot(enable_ema_confluence ? ema_value : na, "EMA", color=color.new(color.blue, 0), linewidth=2)
+
+// Trade Tracking Arrays
+var array<int> trade_months = array.new_int()
+var array<int> trade_years = array.new_int()
+var array<bool> trade_was_tp = array.new_bool()
+var array<float> trade_points = array.new_float()
+var array<string> trade_type = array.new_string() // "GAP_UP" or "GAP_DOWN"
+var array<float> trade_entry_price = array.new_float()
+var array<float> trade_tp_price = array.new_float()
+var array<float> trade_sl_price = array.new_float()
+var array<int> trade_duration_bars = array.new_int() // Track trade duration in bars
+
+// Signal Tracking
+var int total_gapup_signals = 0
+var int total_gapdown_signals = 0
+var int filtered_gapup_vwap = 0
+var int filtered_gapdown_vwap = 0
+var int filtered_gapup_ema = 0
+var int filtered_gapdown_ema = 0
+var int filtered_gapup_volume = 0
+var int filtered_gapdown_volume = 0
+
+// Counters
+var int gapup_tp_count = 0
+var int gapup_sl_count = 0
+var int gapdown_tp_count = 0
+var int gapdown_sl_count = 0
+var int current_sl_streak = 0
+var float current_sl_streak_points = 0.0
+var int max_sl_streak = 0
+var float max_sl_streak_points = 0.0
+
+// Trade State Variables
+var bool in_trade = false
+var string current_trade_type = ""
+var float entry_price = 0.0
+var float tp_price = 0.0
+var float sl_price = 0.0
+var int entry_bar = 0
+var line tp_line = na
+var line sl_line = na
+var label tp_label = na
+var label sl_label = na
+
+bool Gapup = false
+bool Gapdown = false
+
+// Get day's high and low
+var float day_high = na
+var float day_low = na
+
+// Reset day high/low at start of new day
+bool isNewDay = ta.change(time("D")) != 0
+if isNewDay
+    day_high := high
+    day_low := low
+else
+    day_high := math.max(nz(day_high, high), high)
+    day_low := math.min(nz(day_low, low), low)
+
+// Check if the current time is within the range  
+bool isInTimeRange = (hour(time) == 15) and (minute(time) == 15)
+
+log.info("isInTimeRange :" + str.tostring(isInTimeRange))
+
+// Variables declared outside the if block to avoid scope issues
+float PriceNC = na
+float PriceHC = na
+bool base_gapup = false
+bool base_gapdown = false
+bool above_vwap = false
+bool below_vwap = false
+bool above_ema = false
+bool below_ema = false
+bool volume_confirmed = false
+
+if isInTimeRange and not in_trade
+    // Price NC = Normal Candle Close Price
+    // Price HC = Heikin Ashi Candle Close Price
+    PriceNC := close
+    PriceHC := (open + high + low + close) / 4  
+    
+    // Base condition - determine gap up or gap down
+    base_gapup := PriceNC > PriceHC
+    base_gapdown := PriceHC > PriceNC
+    
+    // Confluence filters
+    
+    // VWAP Confluence
+    above_vwap := close > vwap_value
+    below_vwap := close < vwap_value
+    
+    // EMA Confluence
+    above_ema := close > ema_value
+    below_ema := close < ema_value
+    
+    // Volume Confluence
+    volume_confirmed := volume > volume_threshold
+    
+    // Apply confluence filters
+    bool gapup_passed = true
+    bool gapdown_passed = true
+    
+    string rejection_reason_up = ""
+    string rejection_reason_dn = ""
+    
+    if base_gapup
+        total_gapup_signals += 1
+        
+        // Check VWAP confluence
+        if enable_vwap_confluence and not above_vwap
+            gapup_passed := false
+            filtered_gapup_vwap += 1
+            rejection_reason_up := rejection_reason_up + "✗VWAP "
+        
+        // Check EMA confluence
+        if enable_ema_confluence and not above_ema
+            gapup_passed := false
+            filtered_gapup_ema += 1
+            rejection_reason_up := rejection_reason_up + "✗EMA "
+        
+        // Check Volume confluence
+        if enable_volume_confluence and not volume_confirmed
+            gapup_passed := false
+            filtered_gapup_volume += 1
+            rejection_reason_up := rejection_reason_up + "✗VOL "
+        
+        Gapup := gapup_passed
+    
+    if base_gapdown
+        total_gapdown_signals += 1
+        
+        // Check VWAP confluence
+        if enable_vwap_confluence and not below_vwap
+            gapdown_passed := false
+            filtered_gapdown_vwap += 1
+            rejection_reason_dn := rejection_reason_dn + "✗VWAP "
+        
+        // Check EMA confluence
+        if enable_ema_confluence and not below_ema
+            gapdown_passed := false
+            filtered_gapdown_ema += 1
+            rejection_reason_dn := rejection_reason_dn + "✗EMA "
+        
+        // Check Volume confluence
+        if enable_volume_confluence and not volume_confirmed
+            gapdown_passed := false
+            filtered_gapdown_volume += 1
+            rejection_reason_dn := rejection_reason_dn + "✗VOL "
+        
+        Gapdown := gapdown_passed
+    
+    log.info("Gap up (Base):" + str.tostring(base_gapup))
+    log.info("Gap Down (Base):" + str.tostring(base_gapdown))
+    log.info("Above VWAP:" + str.tostring(above_vwap))
+    log.info("Below VWAP:" + str.tostring(below_vwap))
+    log.info("Above EMA:" + str.tostring(above_ema))
+    log.info("Below EMA:" + str.tostring(below_ema))
+    log.info("Volume Confirmed:" + str.tostring(volume_confirmed) + " (" + str.tostring(math.round(volume/avg_volume, 2)) + "x avg)")
+    log.info("Gap up (Final):" + str.tostring(Gapup))
+    log.info("Gap Down (Final):" + str.tostring(Gapdown))
+    log.info("Price Normal Candle :" + str.tostring(PriceNC))
+    log.info("Price Heikin Ashi Candle :" + str.tostring(PriceHC))
+    log.info("Day High: " + str.tostring(day_high))
+    log.info("Day Low: " + str.tostring(day_low))
+    log.info("VWAP: " + str.tostring(vwap_value))
+    log.info("EMA: " + str.tostring(ema_value))
+    log.info("Volume: " + str.tostring(volume))
+    log.info("Avg Volume: " + str.tostring(avg_volume))
+    log.info("Volume Threshold: " + str.tostring(volume_threshold))
+    
+    if Gapup
+        string label_text = "Gap Up\n"
+        if enable_vwap_confluence
+            label_text := label_text + "✓ Above VWAP\n"
+        if enable_ema_confluence
+            label_text := label_text + "✓ Above EMA\n"
+        if enable_volume_confluence
+            label_text := label_text + "✓ Vol: " + str.tostring(math.round(volume/avg_volume, 2)) + "x"
+        
+        label.new(bar_index, high, text=label_text, yloc=yloc.abovebar, style=label.style_label_down, color=color.green, textcolor=color.white, size=size.small) 
+        
+        // Enter trade
+        in_trade := true
+        current_trade_type := "GAP_UP"
+        entry_price := close
+        tp_price := close * (1 + target_percent / 100)
+        sl_price := close * (1 - sl_percent / 100)
+        entry_bar := bar_index
+        
+        // Draw TP and SL lines
+        tp_line := line.new(bar_index, tp_price, bar_index + 1, tp_price, color=color.new(color.green, 30), width=2, style=line.style_dashed)
+        sl_line := line.new(bar_index, sl_price, bar_index + 1, sl_price, color=color.new(color.red, 30), width=2, style=line.style_dashed)
+        
+        // Draw TP and SL labels
+        tp_label := label.new(bar_index, tp_price, "TP: " + str.tostring(math.round(tp_price, 2)), color=color.new(color.green, 30), textcolor=color.white, style=label.style_label_left, size=size.small)
+        sl_label := label.new(bar_index, sl_price, "SL: " + str.tostring(math.round(sl_price, 2)), color=color.new(color.red, 30), textcolor=color.white, style=label.style_label_left, size=size.small)
+
+    if base_gapup and not Gapup
+        // Signal was filtered out - show rejected label
+        string reject_text = "Gap Up\n" + rejection_reason_up
+        label.new(bar_index, high, text=reject_text, yloc=yloc.abovebar, style=label.style_label_down, color=color.new(color.green, 70), textcolor=color.gray, size=size.tiny)
+
+    if Gapdown
+        string label_text = "Gap Down\n"
+        if enable_vwap_confluence
+            label_text := label_text + "✓ Below VWAP\n"
+        if enable_ema_confluence
+            label_text := label_text + "✓ Below EMA\n"
+        if enable_volume_confluence
+            label_text := label_text + "✓ Vol: " + str.tostring(math.round(volume/avg_volume, 2)) + "x"
+        
+        label.new(bar_index, low, text=label_text, yloc=yloc.belowbar, style=label.style_label_up, color=color.red, textcolor=color.white, size=size.small) 
+        
+        // Enter trade
+        in_trade := true
+        current_trade_type := "GAP_DOWN"
+        entry_price := close
+        tp_price := close * (1 - target_percent / 100)
+        sl_price := close * (1 + sl_percent / 100)
+        entry_bar := bar_index
+        
+        // Draw TP and SL lines
+        tp_line := line.new(bar_index, tp_price, bar_index + 1, tp_price, color=color.new(color.green, 30), width=2, style=line.style_dashed)
+        sl_line := line.new(bar_index, sl_price, bar_index + 1, sl_price, color=color.new(color.red, 30), width=2, style=line.style_dashed)
+        
+        // Draw TP and SL labels
+        tp_label := label.new(bar_index, tp_price, "TP: " + str.tostring(math.round(tp_price, 2)), color=color.new(color.green, 30), textcolor=color.white, style=label.style_label_left, size=size.small)
+        sl_label := label.new(bar_index, sl_price, "SL: " + str.tostring(math.round(sl_price, 2)), color=color.new(color.red, 30), textcolor=color.white, style=label.style_label_left, size=size.small)
+
+    if base_gapdown and not Gapdown
+        // Signal was filtered out - show rejected label
+        string reject_text = "Gap Down\n" + rejection_reason_dn
+        label.new(bar_index, low, text=reject_text, yloc=yloc.belowbar, style=label.style_label_up, color=color.new(color.red, 70), textcolor=color.gray, size=size.tiny)
+
+// Manage open trades
+if in_trade
+    // Update line and label positions
+    line.set_x2(tp_line, bar_index)
+    line.set_x2(sl_line, bar_index)
+    label.set_x(tp_label, bar_index + 1)
+    label.set_x(sl_label, bar_index + 1)
+    
+    // Calculate trade duration
+    int trade_duration = bar_index - entry_bar
+    
+    // Check for TP or SL hit
+    if current_trade_type == "GAP_UP"
+        // For gap up trades (long)
+        if high >= tp_price
+            float points_gained = math.abs(tp_price - entry_price)
+            
+            // Record trade
+            array.push(trade_months, month(time))
+            array.push(trade_years, year(time))
+            array.push(trade_was_tp, true)
+            array.push(trade_points, points_gained)
+            array.push(trade_type, "GAP_UP")
+            array.push(trade_entry_price, entry_price)
+            array.push(trade_tp_price, tp_price)
+            array.push(trade_sl_price, sl_price)
+            array.push(trade_duration_bars, trade_duration)
+            
+            gapup_tp_count += 1
+            current_sl_streak := 0
+            current_sl_streak_points := 0.0
+            
+            // Update label
+            label.set_color(tp_label, color.green)
+            label.set_text(tp_label, "✓ TP: " + str.tostring(math.round(tp_price, 2)))
+            
+            in_trade := false
+            
+        else if low <= sl_price
+            float points_lost = math.abs(entry_price - sl_price)
+            
+            // Record trade
+            array.push(trade_months, month(time))
+            array.push(trade_years, year(time))
+            array.push(trade_was_tp, false)
+            array.push(trade_points, points_lost)
+            array.push(trade_type, "GAP_UP")
+            array.push(trade_entry_price, entry_price)
+            array.push(trade_tp_price, tp_price)
+            array.push(trade_sl_price, sl_price)
+            array.push(trade_duration_bars, trade_duration)
+            
+            gapup_sl_count += 1
+            current_sl_streak += 1
+            current_sl_streak_points += points_lost
+            
+            if current_sl_streak > max_sl_streak
+                max_sl_streak := current_sl_streak
+                max_sl_streak_points := current_sl_streak_points
+            
+            // Update label
+            label.set_color(sl_label, color.new(color.red, 0))
+            label.set_text(sl_label, "✗ SL: " + str.tostring(math.round(sl_price, 2)))
+            
+            in_trade := false
+    
+    else if current_trade_type == "GAP_DOWN"
+        // For gap down trades (short)
+        if low <= tp_price
+            float points_gained = math.abs(entry_price - tp_price)
+            
+            // Record trade
+            array.push(trade_months, month(time))
+            array.push(trade_years, year(time))
+            array.push(trade_was_tp, true)
+            array.push(trade_points, points_gained)
+            array.push(trade_type, "GAP_DOWN")
+            array.push(trade_entry_price, entry_price)
+            array.push(trade_tp_price, tp_price)
+            array.push(trade_sl_price, sl_price)
+            array.push(trade_duration_bars, trade_duration)
+            
+            gapdown_tp_count += 1
+            current_sl_streak := 0
+            current_sl_streak_points := 0.0
+            
+            // Update label
+            label.set_color(tp_label, color.green)
+            label.set_text(tp_label, "✓ TP: " + str.tostring(math.round(tp_price, 2)))
+            
+            in_trade := false
+            
+        else if high >= sl_price
+            float points_lost = math.abs(sl_price - entry_price)
+            
+            // Record trade
+            array.push(trade_months, month(time))
+            array.push(trade_years, year(time))
+            array.push(trade_was_tp, false)
+            array.push(trade_points, points_lost)
+            array.push(trade_type, "GAP_DOWN")
+            array.push(trade_entry_price, entry_price)
+            array.push(trade_tp_price, tp_price)
+            array.push(trade_sl_price, sl_price)
+            array.push(trade_duration_bars, trade_duration)
+            
+            gapdown_sl_count += 1
+            current_sl_streak += 1
+            current_sl_streak_points += points_lost
+            
+            if current_sl_streak > max_sl_streak
+                max_sl_streak := current_sl_streak
+                max_sl_streak_points := current_sl_streak_points
+            
+            // Update label
+            label.set_color(sl_label, color.new(color.red, 0))
+            label.set_text(sl_label, "✗ SL: " + str.tostring(math.round(sl_price, 2)))
+            
+            in_trade := false
+
+// Color bars based on trade status
+barcolor(in_trade and current_trade_type == "GAP_UP" ? color.new(color.green, 70) : 
+         in_trade and current_trade_type == "GAP_DOWN" ? color.new(color.red, 70) : na)
+
+
+
+
+// ═══════════════════════════════════════════════════════════════════════════════════
+// HELPER FUNCTIONS FOR PERFORMANCE TABLE
+// ═══════════════════════════════════════════════════════════════════════════════════
+
+getTablePosition(string pos) =>
+    switch pos
+        "top_left" => position.top_left
+        "top_center" => position.top_center
+        "top_right" => position.top_right
+        "middle_left" => position.middle_left
+        "middle_center" => position.middle_center
+        "middle_right" => position.middle_right
+        "bottom_left" => position.bottom_left
+        "bottom_center" => position.bottom_center
+        "bottom_right" => position.bottom_right
+        => position.top_right
+
+getMonthNameWithYear(int m, int y) =>
+    string month_name = switch m
+        1 => "Jan"
+        2 => "Feb"
+        3 => "Mar"
+        4 => "Apr"
+        5 => "May"
+        6 => "Jun"
+        7 => "Jul"
+        8 => "Aug"
+        9 => "Sep"
+        10 => "Oct"
+        11 => "Nov"
+        12 => "Dec"
+        => "Unknown"
+    month_name + " " + str.tostring(y)
+
+calculateWinRate(int tp_trades, int sl_trades) =>
+    int total_trades = tp_trades + sl_trades
+    total_trades > 0 ? math.round((tp_trades / total_trades) * 100, 2) : 0.0
+
+// Function to convert bars to days (approximate)
+barsToDays(int bars, string timeframe_str = "") =>
+    // For daily timeframe, 1 bar = 1 day
+    // For intraday, we need to calculate based on bars per day
+    // Assuming default is daily or will be approximately daily
+    // This is a simplified conversion - adjust based on your actual timeframe
+    int bars_per_day = 1
+    
+    // If using intraday timeframes, adjust accordingly
+    // For 15-min chart: ~25 bars per day (6.5 hours trading)
+    // For 5-min chart: ~75 bars per day
+    // For 1-hour chart: ~6-7 bars per day
+    
+    // You can enhance this based on actual timeframe
+    if timeframe.period == "15"
+        bars_per_day := 25
+    else if timeframe.period == "5"
+        bars_per_day := 75
+    else if timeframe.period == "60"
+        bars_per_day := 7
+    else if timeframe.period == "D" or timeframe.period == "1D"
+        bars_per_day := 1
+    
+    int days = math.max(1, math.round(bars / bars_per_day))
+    days
+
+// ═══════════════════════════════════════════════════════════════════════════════════
+// ENHANCED PERFORMANCE TABLE WITH CONFLUENCE STATS
+// ═══════════════════════════════════════════════════════════════════════════════════
+
+if barstate.islast and show_performance_table
+    int current_month = month(time)
+    int current_year = year(time)
+    
+    var performanceTable = table.new(getTablePosition(table_position), 15, performance_months + 6, bgcolor=color.new(color.black, 20), border_width=1)
+    
+    // Header row - ADDED NEW COLUMN FOR MAX LOSS
+    table.cell(performanceTable, 0, 0, 'Month & Year', text_color=color.white, text_size=size.small, bgcolor=color.new(color.blue, 60))
+    table.cell(performanceTable, 1, 0, 'TP Trades', text_color=color.white, text_size=size.small, bgcolor=color.new(color.green, 60))
+    table.cell(performanceTable, 2, 0, 'SL Trades', text_color=color.white, text_size=size.small, bgcolor=color.new(color.red, 60))
+    table.cell(performanceTable, 3, 0, 'TP Points', text_color=color.white, text_size=size.small, bgcolor=color.new(color.lime, 60))
+    table.cell(performanceTable, 4, 0, 'SL Points', text_color=color.white, text_size=size.small, bgcolor=color.new(color.maroon, 60))
+    table.cell(performanceTable, 5, 0, 'Net Points', text_color=color.white, text_size=size.small, bgcolor=color.new(color.purple, 60))
+    table.cell(performanceTable, 6, 0, 'Win Rate %', text_color=color.white, text_size=size.small, bgcolor=color.new(color.teal, 60))
+    table.cell(performanceTable, 7, 0, 'Profit Factor', text_color=color.white, text_size=size.small, bgcolor=color.new(color.aqua, 60))
+    table.cell(performanceTable, 8, 0, 'PNL (₹)', text_color=color.white, text_size=size.small, bgcolor=color.new(color.yellow, 60))
+    table.cell(performanceTable, 9, 0, 'Max SL Streak', text_color=color.white, text_size=size.small, bgcolor=color.new(color.red, 80))
+    table.cell(performanceTable, 10, 0, 'SL Streak Pts', text_color=color.white, text_size=size.small, bgcolor=color.new(color.maroon, 80))
+    table.cell(performanceTable, 11, 0, 'Gap Up', text_color=color.white, text_size=size.small, bgcolor=color.new(color.green, 80))
+    table.cell(performanceTable, 12, 0, 'Gap Down', text_color=color.white, text_size=size.small, bgcolor=color.new(color.red, 80))
+    table.cell(performanceTable, 13, 0, 'Max Days', text_color=color.white, text_size=size.small, bgcolor=color.new(color.orange, 60), tooltip="Maximum number of days a trade was active in this month")
+    table.cell(performanceTable, 14, 0, 'Max Loss', text_color=color.white, text_size=size.small, bgcolor=color.new(color.red, 60), tooltip="Maximum loss from a single trade in this month")
+    
+    int grand_tp_trades = 0
+    int grand_sl_trades = 0
+    float grand_tp_points = 0.0
+    float grand_sl_points = 0.0
+    int grand_max_trade_days = 0
+    float grand_max_single_loss = 0.0  // NEW: Track overall max single loss
+    
+    // Display configurable months
+    for i = 0 to performance_months - 1
+        int row = i + 1
+        
+        // Calculate how many months to go back from current month
+        int months_back = performance_months - 1 - i
+        
+        // Calculate target month and year
+        int total_months = current_month - months_back
+        int target_year = current_year
+        int target_month = total_months
+        
+        // Adjust for negative months (previous years)
+        while target_month <= 0
+            target_month := target_month + 12
+            target_year := target_year - 1
+        
+        // Count trades for this month/year
+        int month_tp_trades = 0
+        int month_sl_trades = 0
+        float month_tp_points = 0.0
+        float month_sl_points = 0.0
+        int month_gapup_trades = 0
+        int month_gapdown_trades = 0
+        int month_max_sl_streak = 0
+        float month_sl_streak_points = 0.0
+        int month_max_trade_days = 0
+        float month_max_single_loss = 0.0  // NEW: Track max single loss per month
+        
+        // Track consecutive SLs for this month
+        int current_month_sl_streak = 0
+        float current_month_sl_streak_points = 0.0
+        float month_max_sl_streak_points = 0.0
+        
+        // Go through all recorded trades
+        if array.size(trade_months) > 0
+            for j = 0 to array.size(trade_months) - 1
+                int trade_month = array.get(trade_months, j)
+                int trade_year = array.get(trade_years, j)
+                
+                if trade_month == target_month and trade_year == target_year
+                    bool was_tp = array.get(trade_was_tp, j)
+                    float points = array.get(trade_points, j)
+                    string trade_strategy = array.get(trade_type, j)
+                    int trade_bars = array.get(trade_duration_bars, j)
+                    
+                    // Convert bars to days and track maximum
+                    int trade_days = barsToDays(trade_bars)
+                    if trade_days > month_max_trade_days
+                        month_max_trade_days := trade_days
+                    
+                    if was_tp
+                        month_tp_trades += 1
+                        month_tp_points += points
+                        // Reset SL streak on TP
+                        current_month_sl_streak := 0
+                        current_month_sl_streak_points := 0.0
+                    else
+                        month_sl_trades += 1
+                        month_sl_points += points
+                        
+                        // NEW: Track max single loss
+                        if points > month_max_single_loss
+                            month_max_single_loss := points
+                        
+                        // Continue SL streak
+                        current_month_sl_streak += 1
+                        current_month_sl_streak_points += points
+                        
+                        // Update max streak for this month
+                        if current_month_sl_streak > month_max_sl_streak
+                            month_max_sl_streak := current_month_sl_streak
+                            month_max_sl_streak_points := current_month_sl_streak_points
+                    
+                    // Count by trade type
+                    if trade_strategy == "GAP_UP"
+                        month_gapup_trades += 1
+                    else if trade_strategy == "GAP_DOWN"
+                        month_gapdown_trades += 1
+        
+        // Update grand max values
+        if month_max_trade_days > grand_max_trade_days
+            grand_max_trade_days := month_max_trade_days
+        
+        if month_max_single_loss > grand_max_single_loss
+            grand_max_single_loss := month_max_single_loss
+        
+        // Calculations
+        float net_pts = month_tp_points - month_sl_points
+        float win_rate = calculateWinRate(month_tp_trades, month_sl_trades)
+        float profit_factor = month_sl_points > 0 ? math.round(month_tp_points / month_sl_points, 2) : (month_tp_points > 0 ? 999.99 : 0.0)
+        float option_pts = math.round(net_pts * option_multiplier)
+        float pnl = math.round(option_pts * lot_size)
+        
+        // Update grand totals
+        grand_tp_trades += month_tp_trades
+        grand_sl_trades += month_sl_trades
+        grand_tp_points += month_tp_points
+        grand_sl_points += month_sl_points
+        
+        string month_name_with_year = getMonthNameWithYear(target_month, target_year)
+        
+        // Fill table cells
+        table.cell(performanceTable, 0, row, month_name_with_year, text_color=color.white, text_size=size.small)
+        table.cell(performanceTable, 1, row, str.tostring(month_tp_trades), text_color=color.white, text_size=size.small)
+        table.cell(performanceTable, 2, row, str.tostring(month_sl_trades), text_color=color.white, text_size=size.small)
+        table.cell(performanceTable, 3, row, str.tostring(math.round(month_tp_points)), text_color=color.white, text_size=size.small)
+        table.cell(performanceTable, 4, row, str.tostring(math.round(month_sl_points)), text_color=color.white, text_size=size.small)
+        table.cell(performanceTable, 5, row, str.tostring(math.round(net_pts)), text_color=color.white, text_size=size.small)
+        table.cell(performanceTable, 6, row, str.tostring(win_rate) + "%", text_color=color.white, text_size=size.small)
+        table.cell(performanceTable, 7, row, str.tostring(profit_factor), text_color=color.white, text_size=size.small)
+        table.cell(performanceTable, 8, row, str.tostring(pnl), text_color=color.white, text_size=size.small)
+        table.cell(performanceTable, 9, row, str.tostring(month_max_sl_streak), text_color=color.white, text_size=size.small)
+        table.cell(performanceTable, 10, row, str.tostring(math.round(month_max_sl_streak_points)), text_color=color.white, text_size=size.small)
+        table.cell(performanceTable, 11, row, str.tostring(month_gapup_trades), text_color=color.white, text_size=size.small)
+        table.cell(performanceTable, 12, row, str.tostring(month_gapdown_trades), text_color=color.white, text_size=size.small)
+        table.cell(performanceTable, 13, row, str.tostring(month_max_trade_days), text_color=color.white, text_size=size.small)
+        table.cell(performanceTable, 14, row, month_max_single_loss > 0 ? str.tostring(math.round(month_max_single_loss)) : "-", text_color=color.white, text_size=size.small, bgcolor=month_max_single_loss > 0 ? color.new(color.red, 80) : na)
+    
+    // Total row
+    float grand_net_pts = grand_tp_points - grand_sl_points
+    float grand_win_rate = calculateWinRate(grand_tp_trades, grand_sl_trades)
+    float grand_profit_factor = grand_sl_points > 0 ? math.round(grand_tp_points / grand_sl_points, 2) : (grand_tp_points > 0 ? 999.99 : 0.0)
+    float grand_option_pts = math.round(grand_net_pts * option_multiplier)
+    float grand_pnl = math.round(grand_option_pts * lot_size)
+    
+    int total_row = performance_months + 1
+    
+    table.cell(performanceTable, 0, total_row, 'TOTAL', text_color=color.white, text_size=size.small, bgcolor=color.new(color.purple, 60))
+    table.cell(performanceTable, 1, total_row, str.tostring(grand_tp_trades), text_color=color.white, text_size=size.small, bgcolor=color.new(color.purple, 60))
+    table.cell(performanceTable, 2, total_row, str.tostring(grand_sl_trades), text_color=color.white, text_size=size.small, bgcolor=color.new(color.purple, 60))
+    table.cell(performanceTable, 3, total_row, str.tostring(math.round(grand_tp_points)), text_color=color.white, text_size=size.small, bgcolor=color.new(color.purple, 60))
+    table.cell(performanceTable, 4, total_row, str.tostring(math.round(grand_sl_points)), text_color=color.white, text_size=size.small, bgcolor=color.new(color.purple, 60))
+    table.cell(performanceTable, 5, total_row, str.tostring(math.round(grand_net_pts)), text_color=color.white, text_size=size.small, bgcolor=color.new(color.purple, 60))
+    table.cell(performanceTable, 6, total_row, str.tostring(grand_win_rate) + "%", text_color=color.white, text_size=size.small, bgcolor=color.new(color.purple, 60))
+    table.cell(performanceTable, 7, total_row, str.tostring(grand_profit_factor), text_color=color.white, text_size=size.small, bgcolor=color.new(color.purple, 60))
+    table.cell(performanceTable, 8, total_row, str.tostring(grand_pnl), text_color=color.white, text_size=size.small, bgcolor=color.new(color.purple, 60))
+    table.cell(performanceTable, 9, total_row, str.tostring(max_sl_streak), text_color=color.white, text_size=size.small, bgcolor=color.new(color.purple, 60))
+    table.cell(performanceTable, 10, total_row, str.tostring(math.round(max_sl_streak_points)), text_color=color.white, text_size=size.small, bgcolor=color.new(color.purple, 60))
+    table.cell(performanceTable, 11, total_row, str.tostring(gapup_tp_count + gapup_sl_count), text_color=color.white, text_size=size.small, bgcolor=color.new(color.purple, 60))
+    table.cell(performanceTable, 12, total_row, str.tostring(gapdown_tp_count + gapdown_sl_count), text_color=color.white, text_size=size.small, bgcolor=color.new(color.purple, 60))
+    table.cell(performanceTable, 13, total_row, str.tostring(grand_max_trade_days), text_color=color.white, text_size=size.small, bgcolor=color.new(color.purple, 60))
+    table.cell(performanceTable, 14, total_row, str.tostring(math.round(grand_max_single_loss)), text_color=color.white, text_size=size.small, bgcolor=color.new(color.purple, 60))
+    
+    // Strategy Summary Row
+    int strategy_row = performance_months + 2
+    
+    table.cell(performanceTable, 0, strategy_row, 'BTST STATS', text_color=color.white, text_size=size.small, bgcolor=color.new(color.gray, 60))
+    table.cell(performanceTable, 1, strategy_row, 'GapUp: ' + str.tostring(gapup_tp_count) + '/' + str.tostring(gapup_sl_count), text_color=color.white, text_size=size.small, bgcolor=color.new(color.green, 60))
+    table.cell(performanceTable, 2, strategy_row, 'GapDn: ' + str.tostring(gapdown_tp_count) + '/' + str.tostring(gapdown_sl_count), text_color=color.white, text_size=size.small, bgcolor=color.new(color.red, 60))
+    
+    float gapup_wr = gapup_tp_count + gapup_sl_count > 0 ? math.round((gapup_tp_count / (gapup_tp_count + gapup_sl_count)) * 100, 2) : 0.0
+    float gapdown_wr = gapdown_tp_count + gapdown_sl_count > 0 ? math.round((gapdown_tp_count / (gapdown_tp_count + gapdown_sl_count)) * 100, 2) : 0.0
+    
+    table.cell(performanceTable, 3, strategy_row, 'GU WR: ' + str.tostring(gapup_wr) + "%", text_color=color.white, text_size=size.small, bgcolor=color.new(color.green, 60))
+    table.cell(performanceTable, 4, strategy_row, 'GD WR: ' + str.tostring(gapdown_wr) + "%", text_color=color.white, text_size=size.small, bgcolor=color.new(color.red, 60))
+    table.cell(performanceTable, 5, strategy_row, "tradeskishor-oss", text_color=color.white, text_size=size.small, bgcolor=color.new(color.navy, 60))
+    table.cell(performanceTable, 6, strategy_row, 'TP: ' + str.tostring(target_percent) + "%", text_color=color.white, text_size=size.small, bgcolor=color.new(color.green, 60))
+    table.cell(performanceTable, 7, strategy_row, 'SL: ' + str.tostring(sl_percent) + "%", text_color=color.white, text_size=size.small, bgcolor=color.new(color.red, 60))
+    table.cell(performanceTable, 8, strategy_row, in_trade ? "IN TRADE" : "NO TRADE", text_color=color.white, text_size=size.small, bgcolor=in_trade ? color.new(color.orange, 60) : color.new(color.gray, 60))
+    table.cell(performanceTable, 9, strategy_row, 'EMA: ' + str.tostring(ema_length), text_color=color.white, text_size=size.small, bgcolor=color.new(color.blue, 60))
+    
+    // VWAP Confluence Row
+    int vwap_row = performance_months + 3
+    
+    string vwap_status = enable_vwap_confluence ? "ON" : "OFF"
+    float vwap_filter_rate_up = total_gapup_signals > 0 ? math.round((filtered_gapup_vwap / total_gapup_signals) * 100, 2) : 0.0
+    float vwap_filter_rate_dn = total_gapdown_signals > 0 ? math.round((filtered_gapdown_vwap / total_gapdown_signals) * 100, 2) : 0.0
+    
+    table.cell(performanceTable, 0, vwap_row, 'VWAP', text_color=color.white, text_size=size.small, bgcolor=color.new(color.orange, 60))
+    table.cell(performanceTable, 1, vwap_row, vwap_status, text_color=color.white, text_size=size.small, bgcolor=enable_vwap_confluence ? color.new(color.green, 60) : color.new(color.red, 60))
+    table.cell(performanceTable, 2, vwap_row, 'Price vs VWAP', text_color=color.white, text_size=size.small, bgcolor=color.new(color.orange, 60))
+    table.cell(performanceTable, 3, vwap_row, 'Total GU: ' + str.tostring(total_gapup_signals), text_color=color.white, text_size=size.small, bgcolor=color.new(color.green, 70))
+    table.cell(performanceTable, 4, vwap_row, 'Filtered: ' + str.tostring(filtered_gapup_vwap), text_color=color.white, text_size=size.small, bgcolor=color.new(color.orange, 60))
+    table.cell(performanceTable, 5, vwap_row, 'Filter%: ' + str.tostring(vwap_filter_rate_up) + "%", text_color=color.white, text_size=size.small, bgcolor=color.new(color.orange, 60))
+    table.cell(performanceTable, 6, vwap_row, 'Total GD: ' + str.tostring(total_gapdown_signals), text_color=color.white, text_size=size.small, bgcolor=color.new(color.red, 70))
+    table.cell(performanceTable, 7, vwap_row, 'Filtered: ' + str.tostring(filtered_gapdown_vwap), text_color=color.white, text_size=size.small, bgcolor=color.new(color.orange, 60))
+    table.cell(performanceTable, 8, vwap_row, 'Filter%: ' + str.tostring(vwap_filter_rate_dn) + "%", text_color=color.white, text_size=size.small, bgcolor=color.new(color.orange, 60))
+    
+    // EMA Confluence Row
+    int ema_row = performance_months + 4
+    
+    string ema_status = enable_ema_confluence ? "ON" : "OFF"
+    float ema_filter_rate_up = total_gapup_signals > 0 ? math.round((filtered_gapup_ema / total_gapup_signals) * 100, 2) : 0.0
+    float ema_filter_rate_dn = total_gapdown_signals > 0 ? math.round((filtered_gapdown_ema / total_gapdown_signals) * 100, 2) : 0.0
+    
+    table.cell(performanceTable, 0, ema_row, 'EMA (' + str.tostring(ema_length) + ')', text_color=color.white, text_size=size.small, bgcolor=color.new(color.blue, 60))
+    table.cell(performanceTable, 1, ema_row, ema_status, text_color=color.white, text_size=size.small, bgcolor=enable_ema_confluence ? color.new(color.green, 60) : color.new(color.red, 60))
+    table.cell(performanceTable, 2, ema_row, 'Price vs EMA', text_color=color.white, text_size=size.small, bgcolor=color.new(color.blue, 60))
+    table.cell(performanceTable, 3, ema_row, 'Total GU: ' + str.tostring(total_gapup_signals), text_color=color.white, text_size=size.small, bgcolor=color.new(color.green, 70))
+    table.cell(performanceTable, 4, ema_row, 'Filtered: ' + str.tostring(filtered_gapup_ema), text_color=color.white, text_size=size.small, bgcolor=color.new(color.orange, 60))
+    table.cell(performanceTable, 5, ema_row, 'Filter%: ' + str.tostring(ema_filter_rate_up) + "%", text_color=color.white, text_size=size.small, bgcolor=color.new(color.orange, 60))
+    table.cell(performanceTable, 6, ema_row, 'Total GD: ' + str.tostring(total_gapdown_signals), text_color=color.white, text_size=size.small, bgcolor=color.new(color.red, 70))
+    table.cell(performanceTable, 7, ema_row, 'Filtered: ' + str.tostring(filtered_gapdown_ema), text_color=color.white, text_size=size.small, bgcolor=color.new(color.orange, 60))
+    table.cell(performanceTable, 8, ema_row, 'Filter%: ' + str.tostring(ema_filter_rate_dn) + "%", text_color=color.white, text_size=size.small, bgcolor=color.new(color.orange, 60))
+    
+    // Volume Confluence Row
+    int volume_row = performance_months + 5
+    
+    string volume_status = enable_volume_confluence ? "ON" : "OFF"
+    float volume_filter_rate_up = total_gapup_signals > 0 ? math.round((filtered_gapup_volume / total_gapup_signals) * 100, 2) : 0.0
+    float volume_filter_rate_dn = total_gapdown_signals > 0 ? math.round((filtered_gapdown_volume / total_gapdown_signals) * 100, 2) : 0.0
+    
+    table.cell(performanceTable, 0, volume_row, 'VOLUME', text_color=color.white, text_size=size.small, bgcolor=color.new(color.purple, 60))
+    table.cell(performanceTable, 1, volume_row, volume_status, text_color=color.white, text_size=size.small, bgcolor=enable_volume_confluence ? color.new(color.green, 60) : color.new(color.red, 60))
+    table.cell(performanceTable, 2, volume_row, 'Len: ' + str.tostring(volume_length) + ' | Mult: ' + str.tostring(volume_multiplier) + 'x', text_color=color.white, text_size=size.small, bgcolor=color.new(color.purple, 60))
+    table.cell(performanceTable, 3, volume_row, 'Total GU: ' + str.tostring(total_gapup_signals), text_color=color.white, text_size=size.small, bgcolor=color.new(color.green, 70))
+    table.cell(performanceTable, 4, volume_row, 'Filtered: ' + str.tostring(filtered_gapup_volume), text_color=color.white, text_size=size.small, bgcolor=color.new(color.orange, 60))
+    table.cell(performanceTable, 5, volume_row, 'Filter%: ' + str.tostring(volume_filter_rate_up) + "%", text_color=color.white, text_size=size.small, bgcolor=color.new(color.orange, 60))
+    table.cell(performanceTable, 6, volume_row, 'Total GD: ' + str.tostring(total_gapdown_signals), text_color=color.white, text_size=size.small, bgcolor=color.new(color.red, 70))
+    table.cell(performanceTable, 7, volume_row, 'Filtered: ' + str.tostring(filtered_gapdown_volume), text_color=color.white, text_size=size.small, bgcolor=color.new(color.orange, 60))
+    table.cell(performanceTable, 8, volume_row, 'Filter%: ' + str.tostring(volume_filter_rate_dn) + "%", text_color=color.white, text_size=size.small, bgcolor=color.new(color.orange, 60))
+
+
+
+// Alerts
+alertcondition(Gapup, "Gap Up Detected", "BTST Gap Up Signal (All Confluence Passed)")
+alertcondition(Gapdown, "Gap Down Detected", "BTST Gap Down Signal (All Confluence Passed)")
