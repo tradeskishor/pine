@@ -1,0 +1,934 @@
+//@version=6
+indicator("Intraday Buy/Sell - TP Fix Verifiewwwd", overlay=true, max_labels_count=500, max_lines_count=500)
+
+// === INPUTS ===
+Cal = input.string(title="Calculate Buy/Sell Levels based on :",  defval='Todays Open', options=['Todays Open', 'Previous Days High','Previous Days Low','Previous Days Close'])
+ShowTable = input.bool(false, title="Show Buy/Sell Levels in a Table", group="Table Settings") 
+ShowBlvl = input.bool(false, title="Show Buy Levels on Chart", group="Style Settings")
+ShowSlvl = input.bool(false, title="Show Sell Levels on Chart", group="Style Settings")
+ShowHBlvl = input.bool(false, title="Show Historical Buy Levels on Chart", group="Style Settings")
+ShowHSlvl = input.bool(false, title="Show Historical Sell Levels on Chart", group="Style Settings")
+BlvlColor = input.color(color.new(#78fa04,45),"Color for Buy Levels", group="Style Settings")
+SlvlColor = input.color(color.new(#fa2f04,45),"Color for Sell Levels", group="Style Settings")
+TPColor1 = input.color(color.new(#20ffae, 0),"TP1 Color", group="Style Settings")
+TPColor2 = input.color(color.new(#03bcfc, 0),"TP2 Color", group="Style Settings")
+TPColor3 = input.color(color.new(#ffd600, 0),"TP3 Color", group="Style Settings")
+TPColor4 = input.color(color.new(#b388ff, 0),"TP4 Color", group="Style Settings")
+SLColor = input.color(color.new(#ff1744, 0),"SL Color", group="Style Settings")
+EntryBuyColor = input.color(color.new(#00e676, 0),"Buy Entry", group="Style Settings")
+EntrySellColor = input.color(color.new(#f44336, 0),"Sell Entry", group="Style Settings")
+
+label_atr_mult = input.float(1.5, "Label vertical spacing (ATR multiplier)", minval=0.5, maxval=6.0, step=0.1, group="Style Settings")
+exit_label_extra = input.float(0.3, "Extra ATR for exit labels", minval=0.0, maxval=3.0, step=0.1, group="Style Settings")
+
+// 🆕 EMA CONFLUENCE SETTINGS
+g_ema = "EMA Confluence Settings"
+enable_ema_filter = input.bool(false, "Enable EMA Confluence Filter", group=g_ema, tooltip="Only take trades when EMA confirms direction:\n• BUY: EMA must be BELOW Buy Entry\n• SELL: EMA must be ABOVE Sell Entry")
+ema_length = input.int(20, "EMA Length", minval=1, maxval=500, group=g_ema)
+show_ema = input.bool(true, "Show EMA on Chart", group=g_ema)
+ema_color = input.color(color.new(color.yellow, 0), "EMA Color", group=g_ema)
+
+// TP/SL Detection Settings
+g_detection = "TP/SL Detection Settings"
+tp_detection_method = input.string("Wick Touch", "TP Detection Method", options=["Wick Touch", "Candle Close"], group=g_detection)
+sl_detection_method = input.string("Candle Close", "Gann SL Detection Method", options=["Wick Touch", "Candle Close"], group=g_detection, tooltip="Detection method for original Gann-calculated Stop Loss")
+tsl_detection_method = input.string("Candle Close", "Trailing SL Detection Method", options=["Wick Touch", "Candle Close"], group=g_detection, tooltip="Detection method for ATR-based Trailing Stop Loss")
+
+// 🆕 SEPARATE Points Calculation for TP, Gann SL, and Trailing SL
+tp_points_calculation = input.string("Entry Close to Exit Close", "TP Points Calculation Method", 
+     options=["Entry Close to Exit Close", "Entry Close to Exit Wick", "Entry Close to Exit Level", "Entry Level to Exit Level"], 
+     group=g_detection,
+     tooltip="How to calculate points for TP exits:\n• Entry Close to Exit Close: Most realistic\n• Entry Close to Exit Wick: Optimistic (uses wick extreme)\n• Entry Close to Exit Level: Uses exact TP level\n• Entry Level to Exit Level: Original method")
+
+sl_points_calculation = input.string("Entry Close to Exit Close", "Gann SL Points Calculation Method", 
+     options=["Entry Close to Exit Close", "Entry Close to Exit Wick", "Entry Close to Exit Level", "Entry Level to Exit Level"], 
+     group=g_detection,
+     tooltip="How to calculate points for Gann SL exits:\n• Entry Close to Exit Close: Most realistic\n• Entry Close to Exit Wick: Conservative (uses wick extreme)\n• Entry Close to Exit Level: Uses exact SL level\n• Entry Level to Exit Level: Original method")
+
+tsl_points_calculation = input.string("Entry Close to Exit Close", "Trailing SL Points Calculation Method", 
+     options=["Entry Close to Exit Close", "Entry Close to Exit Wick", "Entry Close to Exit Level", "Entry Level to Exit Level"], 
+     group=g_detection,
+     tooltip="How to calculate points for Trailing SL exits:\n• Entry Close to Exit Close: Most realistic\n• Entry Close to Exit Wick: Conservative (uses wick extreme)\n• Entry Close to Exit Level: Uses exact TSL level\n• Entry Level to Exit Level: Original method")
+
+// Exit Target Settings with ATR Buffer
+g_exit = "Exit Settings"
+exit_tp_target = input.string("TP3", "Exit at Target", options=["TP1", "TP2", "TP3", "TP4", "Trailing SL"], group=g_exit, 
+     tooltip="TP1/TP2/TP3/TP4: Exit at specific target\nTrailing SL: Move SL to protect profits as TPs are hit")
+enable_trailing_buffer = input.bool(true, "Enable Trailing SL Buffer", group=g_exit,
+     tooltip="Add buffer below breakeven/TP levels to avoid premature exits")
+trailing_sl_atr_multiplier = input.float(0.8, "Trailing SL Buffer (× ATR)", minval=0, maxval=3.0, step=0.1, group=g_exit,
+     tooltip="Buffer = ATR × this multiplier. Higher = more breathing room")
+enable_eod_exit = input.bool(true, "Enable Weekly EOD Exit", group=g_exit, 
+     tooltip="Exit open trades at end of selected trading day of week")
+eod_day_of_week = input.string("Wednesday", "EOD Exit Day", options=["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"], group=g_exit,
+     tooltip="Select which day of the week to force exit trades")
+eod_hour = input.int(15,'Weekly EOD Hour',minval=0,maxval=23, group=g_exit)
+eod_minute = input.int(15,"Weekly EOD Minute",minval=0,maxval=59, group=g_exit)
+
+// Performance table inputs
+g7 = "Performance Table Settings"
+show_performance_table = input.bool(true, "Show Performance Table", group=g7)
+performance_months = input.int(12, "Performance Months", minval=1, maxval=360, group=g7)
+option_multiplier = input.float(0.6, "Option Multiplier", minval=0.0, maxval=10.0, step=0.1, group=g7)
+lot_size = input.float(525, "Lot Size", minval=1, maxval=100000, step=1, group=g7)
+table_position = input.string("top_right", "Table Position", options=["top_left", "top_center", "top_right", "middle_left", "middle_center", "middle_right", "bottom_left", "bottom_center", "bottom_right"], group=g7)
+
+// 🆕 Calculate EMA
+ema_value = ta.ema(close, ema_length)
+
+// Plot EMA
+plot(show_ema ? ema_value : na, color=ema_color, linewidth=2, title="EMA")
+
+// === GANN CALC ===
+TDO = request.security(syminfo.tickerid, 'D', open, lookahead=barmerge.lookahead_on)
+PDH = request.security(syminfo.tickerid, 'D', high[1], lookahead=barmerge.lookahead_on)
+PDL = request.security(syminfo.tickerid, 'D', low[1], lookahead=barmerge.lookahead_on)
+PDC = request.security(syminfo.tickerid, 'D', close[1], lookahead=barmerge.lookahead_on)
+
+float sqCal = na
+if Cal == 'Todays Open'
+    sqCal := math.sqrt(TDO)
+else if Cal == 'Previous Days High'
+    sqCal := math.sqrt(PDH)
+else if Cal == 'Previous Days Low'
+    sqCal := math.sqrt(PDL)
+else if Cal == 'Previous Days Close'
+    sqCal := math.sqrt(PDC)
+
+Bsl = (sqCal - 0.0625) * (sqCal - 0.0625)
+Bat = (sqCal + 0.125) * (sqCal + 0.125)
+Bt1 = (sqCal + 0.25) * (sqCal + 0.25)
+Bt2 = (sqCal + 0.5) * (sqCal + 0.5)
+Bt3 = (sqCal + 0.75) * (sqCal + 0.75)
+Bt4 = (sqCal + 1) * (sqCal + 1)
+
+Ssl = (sqCal + 0.0625) * (sqCal + 0.0625)
+Sat = (sqCal - 0.125) * (sqCal - 0.125)
+St1 = (sqCal - 0.25) * (sqCal - 0.25)
+St2 = (sqCal - 0.5) * (sqCal - 0.5)
+St3 = (sqCal - 0.75) * (sqCal - 0.75)
+St4 = (sqCal - 1) * (sqCal - 1)
+
+// 🆕 EMA CONFLUENCE CHECK
+// For BUY: EMA should be BELOW Buy Entry (Bat) - price breaking above resistance with EMA support below
+// For SELL: EMA should be ABOVE Sell Entry (Sat) - price breaking below support with EMA resistance above
+bool ema_confirms_buy = not enable_ema_filter or (ema_value < Bat)
+bool ema_confirms_sell = not enable_ema_filter or (ema_value > Sat)
+
+// Entry signals with EMA confluence
+buy_signal = ta.crossover(close, Bat) and ema_confirms_buy
+sell_signal = ta.crossunder(close, Sat) and ema_confirms_sell
+
+// Trade state
+var bool TRADE_ACTIVE = false
+var int TRADE_DIR = 0
+var float ENTRY_PRICE = na
+var float SL_PRICE = na
+var float TP_LEVEL1 = na
+var float TP_LEVEL2 = na
+var float TP_LEVEL3 = na
+var float TP_LEVEL4 = na
+var float EXIT_PRICE = na
+var int ENTRY_BAR = na
+var int ENTRY_TIME = na
+var float ENTRY_CLOSE_PRICE = na
+
+// Trailing SL state
+var float CURRENT_SL = na
+var int HIGHEST_TP_REACHED = 0
+var bool IS_TRAILING_ACTIVE = false
+
+// Alert flags to prevent duplicate alerts
+var bool ALERT_BUY_FIRED = false
+var bool ALERT_SELL_FIRED = false
+var bool ALERT_TP1_FIRED = false
+var bool ALERT_TP2_FIRED = false
+var bool ALERT_TP3_FIRED = false
+var bool ALERT_TP4_FIRED = false
+var bool ALERT_SL_FIRED = false
+var bool ALERT_TSL_FIRED = false
+
+// Arrays
+var array<int> trade_months = array.new_int()
+var array<int> trade_years = array.new_int()
+var array<bool> trade_was_tp = array.new_bool()
+var array<float> trade_points = array.new_float()
+var array<int> trade_duration_days = array.new_int()
+var array<int> trade_direction = array.new_int()
+var array<string> trade_exit_type = array.new_string()
+
+// TP TOUCHED ARRAYS
+var array<bool> trade_touched_tp1 = array.new_bool()
+var array<bool> trade_touched_tp2 = array.new_bool()
+var array<bool> trade_touched_tp3 = array.new_bool()
+var array<bool> trade_touched_tp4 = array.new_bool()
+
+// Check if it's the selected day of week for EOD exit
+int current_hour = hour(time, syminfo.timezone)
+int current_minute = minute(time, syminfo.timezone)
+int current_dayofweek = dayofweek(time, syminfo.timezone)
+
+// Map selected day to dayofweek constant
+int selected_eod_day = switch eod_day_of_week
+    "Monday" => dayofweek.monday
+    "Tuesday" => dayofweek.tuesday
+    "Wednesday" => dayofweek.wednesday
+    "Thursday" => dayofweek.thursday
+    "Friday" => dayofweek.friday
+    => dayofweek.friday
+
+bool is_eod_day = current_dayofweek == selected_eod_day
+bool is_eod_exit_time = enable_eod_exit and is_eod_day and current_hour == eod_hour and current_minute == eod_minute
+
+atr14 = ta.atr(14)
+
+f_label_y_entry_buy(float price) => price - atr14 * label_atr_mult
+f_label_y_entry_sell(float price) => price + atr14 * label_atr_mult
+f_label_y_exit_tp_buy(float price) => price + atr14 * (label_atr_mult + exit_label_extra)
+f_label_y_exit_tp_sell(float price) => price - atr14 * (label_atr_mult + exit_label_extra)
+f_label_y_exit_sl_buy(float price) => price - atr14 * (label_atr_mult + exit_label_extra)
+f_label_y_exit_sl_sell(float price) => price + atr14 * (label_atr_mult + exit_label_extra)
+
+// Function to get trailing buffer
+f_get_trailing_buffer() =>
+    enable_trailing_buffer ? (atr14 * trailing_sl_atr_multiplier) : 0.0
+
+// Calculate actual calendar days from timestamps (works on ANY timeframe)
+f_calculate_days_in_trade(int entry_timestamp, int exit_timestamp) =>
+    int milliseconds_diff = exit_timestamp - entry_timestamp
+    int milliseconds_per_day = 86400000
+    int calendar_days = math.max(1, math.round(milliseconds_diff / float(milliseconds_per_day)))
+    calendar_days
+
+// Entry
+if not TRADE_ACTIVE
+    if buy_signal
+        ENTRY_PRICE := Bat
+        ENTRY_CLOSE_PRICE := close
+        SL_PRICE := Bsl
+        CURRENT_SL := Bsl
+        TP_LEVEL1 := Bt1
+        TP_LEVEL2 := Bt2
+        TP_LEVEL3 := Bt3
+        TP_LEVEL4 := Bt4
+        ENTRY_BAR := bar_index
+        ENTRY_TIME := time
+        TRADE_DIR := 1
+        TRADE_ACTIVE := true
+        HIGHEST_TP_REACHED := 0
+        IS_TRAILING_ACTIVE := false
+        
+        // Reset all alert flags on new trade
+        ALERT_BUY_FIRED := true
+        ALERT_SELL_FIRED := false
+        ALERT_TP1_FIRED := false
+        ALERT_TP2_FIRED := false
+        ALERT_TP3_FIRED := false
+        ALERT_TP4_FIRED := false
+        ALERT_SL_FIRED := false
+        ALERT_TSL_FIRED := false
+        
+        string label_text = "BUY\n" + str.tostring(math.round(Bat, 2))
+        if enable_ema_filter
+            label_text := label_text + "\nEMA✓"
+        
+        label.new(x=bar_index, y=f_label_y_entry_buy(Bat), text=label_text, 
+                  style=label.style_label_up, color=EntryBuyColor, textcolor=color.white, size=size.normal)
+                  
+    else if sell_signal
+        ENTRY_PRICE := Sat
+        ENTRY_CLOSE_PRICE := close
+        SL_PRICE := Ssl
+        CURRENT_SL := Ssl
+        TP_LEVEL1 := St1
+        TP_LEVEL2 := St2
+        TP_LEVEL3 := St3
+        TP_LEVEL4 := St4
+        ENTRY_BAR := bar_index
+        ENTRY_TIME := time
+        TRADE_DIR := -1
+        TRADE_ACTIVE := true
+        HIGHEST_TP_REACHED := 0
+        IS_TRAILING_ACTIVE := false
+        
+        // Reset all alert flags on new trade
+        ALERT_BUY_FIRED := false
+        ALERT_SELL_FIRED := true
+        ALERT_TP1_FIRED := false
+        ALERT_TP2_FIRED := false
+        ALERT_TP3_FIRED := false
+        ALERT_TP4_FIRED := false
+        ALERT_SL_FIRED := false
+        ALERT_TSL_FIRED := false
+        
+        string label_text = "SELL\n" + str.tostring(math.round(Sat, 2))
+        if enable_ema_filter
+            label_text := label_text + "\nEMA✓"
+        
+        label.new(x=bar_index, y=f_label_y_entry_sell(Sat), text=label_text, 
+                  style=label.style_label_down, color=EntrySellColor, textcolor=color.white, size=size.normal)
+
+// Function to check TP hit based on detection method
+f_check_tp_hit_buy(float tp_level) =>
+    if tp_detection_method == "Wick Touch"
+        high >= tp_level
+    else
+        close >= tp_level
+
+f_check_tp_hit_sell(float tp_level) =>
+    if tp_detection_method == "Wick Touch"
+        low <= tp_level
+    else
+        close <= tp_level
+
+// Function to check GANN SL hit based on detection method
+f_check_gann_sl_hit_buy(float sl_level) =>
+    if sl_detection_method == "Wick Touch"
+        low <= sl_level
+    else
+        close <= sl_level
+
+f_check_gann_sl_hit_sell(float sl_level) =>
+    if sl_detection_method == "Wick Touch"
+        high >= sl_level
+    else
+        close >= sl_level
+
+// Function to check TRAILING SL hit based on detection method
+f_check_tsl_hit_buy(float tsl_level) =>
+    if tsl_detection_method == "Wick Touch"
+        low <= tsl_level
+    else
+        close <= tsl_level
+
+f_check_tsl_hit_sell(float tsl_level) =>
+    if tsl_detection_method == "Wick Touch"
+        high >= tsl_level
+    else
+        close >= tsl_level
+
+// UPDATED: Separate points calculation for TP, Gann SL, and Trailing SL exits
+f_calculate_points(int direction, float entry_level, float entry_close, float exit_level, float exit_close, float exit_wick, string exit_type) =>
+    float entry_ref = na
+    float exit_ref = na
+    
+    // Select the correct calculation method based on exit type
+    string calc_method = exit_type == "TP" ? tp_points_calculation : (exit_type == "GANN_SL" ? sl_points_calculation : tsl_points_calculation)
+    
+    if calc_method == "Entry Close to Exit Close"
+        entry_ref := entry_close
+        exit_ref := exit_close
+    else if calc_method == "Entry Close to Exit Wick"
+        entry_ref := entry_close
+        exit_ref := exit_wick
+    else if calc_method == "Entry Close to Exit Level"
+        entry_ref := entry_close
+        exit_ref := exit_level
+    else  // "Entry Level to Exit Level"
+        entry_ref := entry_level
+        exit_ref := exit_level
+    
+    float result = direction == 1 ? (exit_ref - entry_ref) : (entry_ref - exit_ref)
+    result
+
+// Exit handling
+if TRADE_ACTIVE
+    var bool TP1_HIT = false
+    var bool TP2_HIT = false
+    var bool TP3_HIT = false
+    var bool TP4_HIT = false
+    var bool SL_HIT = false
+
+    if TRADE_DIR == 1  // BUY
+        // Check TP hits and fire alerts
+        if f_check_tp_hit_buy(TP_LEVEL4) and not TP4_HIT
+            TP4_HIT := true
+            if not ALERT_TP4_FIRED
+                ALERT_TP4_FIRED := true
+            if exit_tp_target == "Trailing SL" and HIGHEST_TP_REACHED < 4
+                HIGHEST_TP_REACHED := 4
+                float buffer = f_get_trailing_buffer()
+                CURRENT_SL := TP_LEVEL3 - buffer
+                IS_TRAILING_ACTIVE := true
+                
+        if f_check_tp_hit_buy(TP_LEVEL3) and not TP3_HIT
+            TP3_HIT := true
+            if not ALERT_TP3_FIRED
+                ALERT_TP3_FIRED := true
+            if exit_tp_target == "Trailing SL" and HIGHEST_TP_REACHED < 3
+                HIGHEST_TP_REACHED := 3
+                float buffer = f_get_trailing_buffer()
+                CURRENT_SL := TP_LEVEL2 - buffer
+                IS_TRAILING_ACTIVE := true
+                
+        if f_check_tp_hit_buy(TP_LEVEL2) and not TP2_HIT
+            TP2_HIT := true
+            if not ALERT_TP2_FIRED
+                ALERT_TP2_FIRED := true
+            if exit_tp_target == "Trailing SL" and HIGHEST_TP_REACHED < 2
+                HIGHEST_TP_REACHED := 2
+                float buffer = f_get_trailing_buffer()
+                CURRENT_SL := TP_LEVEL1 - buffer
+                IS_TRAILING_ACTIVE := true
+                
+        if f_check_tp_hit_buy(TP_LEVEL1) and not TP1_HIT
+            TP1_HIT := true
+            if not ALERT_TP1_FIRED
+                ALERT_TP1_FIRED := true
+            if exit_tp_target == "Trailing SL" and HIGHEST_TP_REACHED < 1
+                HIGHEST_TP_REACHED := 1
+                float buffer = f_get_trailing_buffer()
+                CURRENT_SL := ENTRY_CLOSE_PRICE - buffer
+                IS_TRAILING_ACTIVE := true
+        
+        // Check SL hit using appropriate detection method
+        if IS_TRAILING_ACTIVE
+            // Use Trailing SL detection
+            if f_check_tsl_hit_buy(CURRENT_SL)
+                SL_HIT := true
+        else
+            // Use Gann SL detection
+            if f_check_gann_sl_hit_buy(CURRENT_SL)
+                SL_HIT := true
+
+        bool exit_here = false
+        string exit_reason = ""
+        float exit_price_used = na
+        color exit_color = na
+        string exit_type = ""
+        
+        if exit_tp_target == "Trailing SL"
+            if SL_HIT
+                EXIT_PRICE := CURRENT_SL
+                exit_reason := HIGHEST_TP_REACHED > 0 ? "TSL" : "SL"
+                exit_price_used := CURRENT_SL
+                exit_color := HIGHEST_TP_REACHED > 0 ? color.new(color.orange, 0) : SLColor
+                exit_here := true
+                exit_type := HIGHEST_TP_REACHED > 0 ? "TRAILING_SL" : "GANN_SL"
+                if exit_reason == "TSL" and not ALERT_TSL_FIRED
+                    ALERT_TSL_FIRED := true
+                else if exit_reason == "SL" and not ALERT_SL_FIRED
+                    ALERT_SL_FIRED := true
+            else if is_eod_exit_time
+                EXIT_PRICE := close
+                exit_reason := "EOD"
+                exit_price_used := close
+                exit_color := color.new(color.gray, 0)
+                exit_here := true
+                exit_type := IS_TRAILING_ACTIVE ? "TRAILING_SL" : "GANN_SL"
+        else
+            if exit_tp_target == "TP4" and TP4_HIT
+                EXIT_PRICE := TP_LEVEL4
+                exit_reason := "TP4"
+                exit_price_used := TP_LEVEL4
+                exit_color := TPColor4
+                exit_here := true
+                exit_type := "TP"
+            else if exit_tp_target == "TP3" and TP3_HIT
+                EXIT_PRICE := TP_LEVEL3
+                exit_reason := "TP3"
+                exit_price_used := TP_LEVEL3
+                exit_color := TPColor3
+                exit_here := true
+                exit_type := "TP"
+            else if exit_tp_target == "TP2" and TP2_HIT
+                EXIT_PRICE := TP_LEVEL2
+                exit_reason := "TP2"
+                exit_price_used := TP_LEVEL2
+                exit_color := TPColor2
+                exit_here := true
+                exit_type := "TP"
+            else if exit_tp_target == "TP1" and TP1_HIT
+                EXIT_PRICE := TP_LEVEL1
+                exit_reason := "TP1"
+                exit_price_used := TP_LEVEL1
+                exit_color := TPColor1
+                exit_here := true
+                exit_type := "TP"
+            else if SL_HIT
+                EXIT_PRICE := SL_PRICE
+                exit_reason := "SL"
+                exit_price_used := SL_PRICE
+                exit_color := SLColor
+                exit_here := true
+                exit_type := "GANN_SL"
+                if not ALERT_SL_FIRED
+                    ALERT_SL_FIRED := true
+            else if is_eod_exit_time
+                EXIT_PRICE := close
+                exit_reason := "EOD"
+                exit_price_used := close
+                exit_color := color.new(color.gray, 0)
+                exit_here := true
+                exit_type := "GANN_SL"
+
+        if exit_here
+            float exit_wick_high = high
+            float exit_wick_low = low
+            
+            // Determine which wick to pass based on exit type
+            float exit_wick_value = na
+            if exit_type == "TP"
+                exit_wick_value := tp_detection_method == "Wick Touch" ? exit_wick_high : close
+            else if exit_type == "GANN_SL"
+                exit_wick_value := sl_detection_method == "Wick Touch" ? exit_wick_low : close
+            else  // TRAILING_SL
+                exit_wick_value := tsl_detection_method == "Wick Touch" ? exit_wick_low : close
+            
+            // Calculate points - function will use the appropriate reference based on calc method
+            float pts = f_calculate_points(1, ENTRY_PRICE, ENTRY_CLOSE_PRICE, EXIT_PRICE, close, exit_wick_value, exit_type)
+            bool is_winner = pts > 0
+            
+            int days_in_trade = f_calculate_days_in_trade(ENTRY_TIME, time)
+            
+            array.push(trade_months, month(time))
+            array.push(trade_years, year(time))
+            array.push(trade_was_tp, is_winner)
+            array.push(trade_points, math.abs(pts))
+            array.push(trade_duration_days, days_in_trade)
+            array.push(trade_direction, 1)
+            array.push(trade_exit_type, exit_reason)
+            
+            array.push(trade_touched_tp1, TP1_HIT)
+            array.push(trade_touched_tp2, TP2_HIT)
+            array.push(trade_touched_tp3, TP3_HIT)
+            array.push(trade_touched_tp4, TP4_HIT)
+
+            bool isTP = str.contains(exit_reason, "TP") or exit_reason == "TSL"
+            float label_y = isTP ? f_label_y_exit_tp_buy(EXIT_PRICE) : f_label_y_exit_sl_buy(EXIT_PRICE)
+            
+            string lbltxt = exit_reason
+            if exit_reason == "TSL"
+                lbltxt := "TSL (TP" + str.tostring(HIGHEST_TP_REACHED) + ")"
+            lbltxt := lbltxt + "\n" + (is_winner ? "+" : "-") + str.tostring(math.round(math.abs(pts), 2))
+            lbltxt := lbltxt + "\n" + str.tostring(days_in_trade) + "d"
+            
+            label.new(x=bar_index, y=label_y, text=lbltxt, 
+                      style=isTP ? label.style_label_down : label.style_label_up, 
+                      textcolor=color.white, color=exit_color, size=size.small)
+
+            TRADE_ACTIVE := false
+            TP1_HIT := false
+            TP2_HIT := false
+            TP3_HIT := false
+            TP4_HIT := false
+            SL_HIT := false
+            HIGHEST_TP_REACHED := 0
+            IS_TRAILING_ACTIVE := false
+
+    else if TRADE_DIR == -1  // SELL
+        // Check TP hits and fire alerts
+        if f_check_tp_hit_sell(TP_LEVEL4) and not TP4_HIT
+            TP4_HIT := true
+            if not ALERT_TP4_FIRED
+                ALERT_TP4_FIRED := true
+            if exit_tp_target == "Trailing SL" and HIGHEST_TP_REACHED < 4
+                HIGHEST_TP_REACHED := 4
+                float buffer = f_get_trailing_buffer()
+                CURRENT_SL := TP_LEVEL3 + buffer
+                IS_TRAILING_ACTIVE := true
+                
+        if f_check_tp_hit_sell(TP_LEVEL3) and not TP3_HIT
+            TP3_HIT := true
+            if not ALERT_TP3_FIRED
+                ALERT_TP3_FIRED := true
+            if exit_tp_target == "Trailing SL" and HIGHEST_TP_REACHED < 3
+                HIGHEST_TP_REACHED := 3
+                float buffer = f_get_trailing_buffer()
+                CURRENT_SL := TP_LEVEL2 + buffer
+                IS_TRAILING_ACTIVE := true
+                
+        if f_check_tp_hit_sell(TP_LEVEL2) and not TP2_HIT
+            TP2_HIT := true
+            if not ALERT_TP2_FIRED
+                ALERT_TP2_FIRED := true
+            if exit_tp_target == "Trailing SL" and HIGHEST_TP_REACHED < 2
+                HIGHEST_TP_REACHED := 2
+                float buffer = f_get_trailing_buffer()
+                CURRENT_SL := TP_LEVEL1 + buffer
+                IS_TRAILING_ACTIVE := true
+                
+        if f_check_tp_hit_sell(TP_LEVEL1) and not TP1_HIT
+            TP1_HIT := true
+            if not ALERT_TP1_FIRED
+                ALERT_TP1_FIRED := true
+            if exit_tp_target == "Trailing SL" and HIGHEST_TP_REACHED < 1
+                HIGHEST_TP_REACHED := 1
+                float buffer = f_get_trailing_buffer()
+                CURRENT_SL := ENTRY_CLOSE_PRICE + buffer
+                IS_TRAILING_ACTIVE := true
+        
+        // Check SL hit using appropriate detection method
+        if IS_TRAILING_ACTIVE
+            // Use Trailing SL detection
+            if f_check_tsl_hit_sell(CURRENT_SL)
+                SL_HIT := true
+        else
+            // Use Gann SL detection
+            if f_check_gann_sl_hit_sell(CURRENT_SL)
+                SL_HIT := true
+
+        bool exit_here = false
+        string exit_reason = ""
+        float exit_price_used = na
+        color exit_color = na
+        string exit_type = ""
+        
+        if exit_tp_target == "Trailing SL"
+            if SL_HIT
+                EXIT_PRICE := CURRENT_SL
+                exit_reason := HIGHEST_TP_REACHED > 0 ? "TSL" : "SL"
+                exit_price_used := CURRENT_SL
+                exit_color := HIGHEST_TP_REACHED > 0 ? color.new(color.orange, 0) : SLColor
+                exit_here := true
+                exit_type := HIGHEST_TP_REACHED > 0 ? "TRAILING_SL" : "GANN_SL"
+                if exit_reason == "TSL" and not ALERT_TSL_FIRED
+                    ALERT_TSL_FIRED := true
+                else if exit_reason == "SL" and not ALERT_SL_FIRED
+                    ALERT_SL_FIRED := true
+            else if is_eod_exit_time
+                EXIT_PRICE := close
+                exit_reason := "EOD"
+                exit_price_used := close
+                exit_color := color.new(color.gray, 0)
+                exit_here := true
+                exit_type := IS_TRAILING_ACTIVE ? "TRAILING_SL" : "GANN_SL"
+        else
+            if exit_tp_target == "TP4" and TP4_HIT
+                EXIT_PRICE := TP_LEVEL4
+                exit_reason := "TP4"
+                exit_price_used := TP_LEVEL4
+                exit_color := TPColor4
+                exit_here := true
+                exit_type := "TP"
+            else if exit_tp_target == "TP3" and TP3_HIT
+                EXIT_PRICE := TP_LEVEL3
+                exit_reason := "TP3"
+                exit_price_used := TP_LEVEL3
+                exit_color := TPColor3
+                exit_here := true
+                exit_type := "TP"
+            else if exit_tp_target == "TP2" and TP2_HIT
+                EXIT_PRICE := TP_LEVEL2
+                exit_reason := "TP2"
+                exit_price_used := TP_LEVEL2
+                exit_color := TPColor2
+                exit_here := true
+                exit_type := "TP"
+            else if exit_tp_target == "TP1" and TP1_HIT
+                EXIT_PRICE := TP_LEVEL1
+                exit_reason := "TP1"
+                exit_price_used := TP_LEVEL1
+                exit_color := TPColor1
+                exit_here := true
+                exit_type := "TP"
+            else if SL_HIT
+                EXIT_PRICE := SL_PRICE
+                exit_reason := "SL"
+                exit_price_used := SL_PRICE
+                exit_color := SLColor
+                exit_here := true
+                exit_type := "GANN_SL"
+                if not ALERT_SL_FIRED
+                    ALERT_SL_FIRED := true
+            else if is_eod_exit_time
+                EXIT_PRICE := close
+                exit_reason := "EOD"
+                exit_price_used := close
+                exit_color := color.new(color.gray, 0)
+                exit_here := true
+                exit_type := "GANN_SL"
+
+        if exit_here
+            float exit_wick_high = high
+            float exit_wick_low = low
+            
+            // Determine which wick to pass based on exit type
+            float exit_wick_value = na
+            if exit_type == "TP"
+                exit_wick_value := tp_detection_method == "Wick Touch" ? exit_wick_low : close
+            else if exit_type == "GANN_SL"
+                exit_wick_value := sl_detection_method == "Wick Touch" ? exit_wick_high : close
+            else  // TRAILING_SL
+                exit_wick_value := tsl_detection_method == "Wick Touch" ? exit_wick_high : close
+            
+            // Calculate points - function will use the appropriate reference based on calc method
+            float pts = f_calculate_points(-1, ENTRY_PRICE, ENTRY_CLOSE_PRICE, EXIT_PRICE, close, exit_wick_value, exit_type)
+            bool is_winner = pts > 0
+            
+            int days_in_trade = f_calculate_days_in_trade(ENTRY_TIME, time)
+            
+            array.push(trade_months, month(time))
+            array.push(trade_years, year(time))
+            array.push(trade_was_tp, is_winner)
+            array.push(trade_points, math.abs(pts))
+            array.push(trade_duration_days, days_in_trade)
+            array.push(trade_direction, -1)
+            array.push(trade_exit_type, exit_reason)
+            
+            array.push(trade_touched_tp1, TP1_HIT)
+            array.push(trade_touched_tp2, TP2_HIT)
+            array.push(trade_touched_tp3, TP3_HIT)
+            array.push(trade_touched_tp4, TP4_HIT)
+
+            bool isTP = str.contains(exit_reason, "TP") or exit_reason == "TSL"
+            float label_y = isTP ? f_label_y_exit_tp_sell(EXIT_PRICE) : f_label_y_exit_sl_sell(EXIT_PRICE)
+            
+            string lbltxt = exit_reason
+            if exit_reason == "TSL"
+                lbltxt := "TSL (TP" + str.tostring(HIGHEST_TP_REACHED) + ")"
+            lbltxt := lbltxt + "\n" + (is_winner ? "+" : "-") + str.tostring(math.round(math.abs(pts), 2))
+            lbltxt := lbltxt + "\n" + str.tostring(days_in_trade) + "d"
+            
+            label.new(x=bar_index, y=label_y, text=lbltxt, 
+                      style=isTP ? label.style_label_up : label.style_label_down, 
+                      textcolor=color.white, color=exit_color, size=size.small)
+
+            TRADE_ACTIVE := false
+            TP1_HIT := false
+            TP2_HIT := false
+            TP3_HIT := false
+            TP4_HIT := false
+            SL_HIT := false
+            HIGHEST_TP_REACHED := 0
+            IS_TRAILING_ACTIVE := false
+
+// Plot trailing SL on chart
+plot(TRADE_ACTIVE and exit_tp_target == "Trailing SL" ? CURRENT_SL : na, 
+     color=color.new(color.orange, 0), style=plot.style_circles, linewidth=2, title="Trailing SL")
+
+plot(ShowBlvl ? Bat : na, color=EntryBuyColor, style=plot.style_line, linewidth=2, title="Buy Entry")
+plot(ShowBlvl ? Bsl : na, color=SLColor, style=plot.style_line, linewidth=2, title="Buy SL")
+plot(ShowBlvl ? Bt1 : na, color=TPColor1, style=plot.style_line, linewidth=1, title="Buy TP1")
+plot(ShowBlvl ? Bt2 : na, color=TPColor2, style=plot.style_line, linewidth=1, title="Buy TP2")
+plot(ShowBlvl ? Bt3 : na, color=TPColor3, style=plot.style_line, linewidth=1, title="Buy TP3")
+plot(ShowBlvl ? Bt4 : na, color=TPColor4, style=plot.style_line, linewidth=1, title="Buy TP4")
+plot(ShowSlvl ? Sat : na, color=EntrySellColor, style=plot.style_line, linewidth=2, title="Sell Entry")
+plot(ShowSlvl ? Ssl : na, color=SLColor, style=plot.style_line, linewidth=2, title="Sell SL")
+plot(ShowSlvl ? St1 : na, color=TPColor1, style=plot.style_line, linewidth=1, title="Sell TP1")
+plot(ShowSlvl ? St2 : na, color=TPColor2, style=plot.style_line, linewidth=1, title="Sell TP2")
+plot(ShowSlvl ? St3 : na, color=TPColor3, style=plot.style_line, linewidth=1, title="Sell TP3")
+plot(ShowSlvl ? St4 : na, color=TPColor4, style=plot.style_line, linewidth=1, title="Sell TP4")
+
+getTablePosition(string pos) =>
+    switch pos
+        "top_left" => position.top_left
+        "top_center" => position.top_center
+        "top_right" => position.top_right
+        "middle_left" => position.middle_left
+        "middle_center" => position.middle_center
+        "middle_right" => position.middle_right
+        "bottom_left" => position.bottom_left
+        "bottom_center" => position.bottom_center
+        "bottom_right" => position.bottom_right
+        => position.top_right
+
+getMonthNameWithYear(int m, int y) =>
+    string month_name = switch m
+        1 => "Jan"
+        2 => "Feb"
+        3 => "Mar"
+        4 => "Apr"
+        5 => "May"
+        6 => "Jun"
+        7 => "Jul"
+        8 => "Aug"
+        9 => "Sep"
+        10 => "Oct"
+        11 => "Nov"
+        12 => "Dec"
+        => "Unknown"
+    month_name + " " + str.tostring(y)
+
+calculateWinRate(int tp_trades, int sl_trades) =>
+    int total_trades = tp_trades + sl_trades
+    total_trades > 0 ? math.round((tp_trades / total_trades) * 100, 2) : 0.0
+
+// === PERFORMANCE TABLE ===
+if barstate.islast and show_performance_table
+    int current_month = month(time)
+    int current_year = year(time)
+    
+    var table performanceTable = table.new(getTablePosition(table_position), 13, performance_months + 2, bgcolor=color.new(color.black, 20), border_width=1)
+    
+    // Column headers
+    table.cell(performanceTable, 0, 0, 'Month & Year', text_color=color.white, text_size=size.small, bgcolor=color.new(color.blue, 60))
+    table.cell(performanceTable, 1, 0, 'TP Trades', text_color=color.white, text_size=size.small, bgcolor=color.new(color.green, 60))
+    table.cell(performanceTable, 2, 0, 'SL Trades', text_color=color.white, text_size=size.small, bgcolor=color.new(color.red, 60))
+    table.cell(performanceTable, 3, 0, 'TP Points', text_color=color.white, text_size=size.small, bgcolor=color.new(color.lime, 60))
+    table.cell(performanceTable, 4, 0, 'SL Points', text_color=color.white, text_size=size.small, bgcolor=color.new(color.maroon, 60))
+    table.cell(performanceTable, 5, 0, 'Net Points', text_color=color.white, text_size=size.small, bgcolor=color.new(color.purple, 60))
+    table.cell(performanceTable, 6, 0, 'Win Rate %', text_color=color.white, text_size=size.small, bgcolor=color.new(color.teal, 60))
+    table.cell(performanceTable, 7, 0, 'Profit Factor', text_color=color.white, text_size=size.small, bgcolor=color.new(color.aqua, 60))
+    table.cell(performanceTable, 8, 0, 'PNL (₹)', text_color=color.white, text_size=size.small, bgcolor=color.new(color.yellow, 60))
+    table.cell(performanceTable, 9, 0, 'Max SL Streak', text_color=color.white, text_size=size.small, bgcolor=color.new(color.red, 80))
+    table.cell(performanceTable, 10, 0, 'Min TP Pts', text_color=color.white, text_size=size.small, bgcolor=color.new(color.green, 70), 
+         tooltip="Smallest single TP win in points during the month")
+    table.cell(performanceTable, 11, 0, 'Max SL Pts', text_color=color.white, text_size=size.small, bgcolor=color.new(color.red, 70), 
+         tooltip="Largest single SL loss in points during the month")
+    table.cell(performanceTable, 12, 0, 'Max Days', text_color=color.white, text_size=size.small, bgcolor=color.new(color.orange, 60), 
+         tooltip="Maximum number of calendar days a single trade was active")
+    
+    int grand_tp_trades = 0
+    int grand_sl_trades = 0
+    float grand_tp_points = 0.0
+    float grand_sl_points = 0.0
+    float grand_max_single_sl = 0.0
+    float grand_min_single_tp = 999999.0
+    int grand_max_trade_duration_days = 0
+    
+    for i = 0 to performance_months - 1
+        int row = i + 1
+        int months_back = performance_months - 1 - i
+        int total_months = current_month - months_back
+        int target_year = current_year
+        int target_month = total_months
+        
+        while target_month <= 0
+            target_month := target_month + 12
+            target_year := target_year - 1
+        
+        int month_tp_trades = 0
+        int month_sl_trades = 0
+        float month_tp_points = 0.0
+        float month_sl_points = 0.0
+        int month_max_sl_streak = 0
+        float month_max_single_sl = 0.0
+        float month_min_single_tp = 999999.0
+        int month_max_trade_duration_days = 0
+        int current_month_sl_streak = 0
+        
+        if array.size(trade_months) > 0
+            for j = 0 to array.size(trade_months) - 1
+                int trade_month = array.get(trade_months, j)
+                int trade_year = array.get(trade_years, j)
+                
+                if trade_month == target_month and trade_year == target_year
+                    bool was_tp = array.get(trade_was_tp, j)
+                    float points = array.get(trade_points, j)
+                    int duration_days = array.get(trade_duration_days, j)
+                    
+                    if duration_days > month_max_trade_duration_days
+                        month_max_trade_duration_days := duration_days
+                    
+                    if was_tp
+                        month_tp_trades += 1
+                        month_tp_points += points
+                        current_month_sl_streak := 0
+                        
+                        if points < month_min_single_tp
+                            month_min_single_tp := points
+                    else
+                        month_sl_trades += 1
+                        month_sl_points += points
+                        
+                        if points > month_max_single_sl
+                            month_max_single_sl := points
+                        
+                        current_month_sl_streak += 1
+                        if current_month_sl_streak > month_max_sl_streak
+                            month_max_sl_streak := current_month_sl_streak
+        
+        if month_max_trade_duration_days > grand_max_trade_duration_days
+            grand_max_trade_duration_days := month_max_trade_duration_days
+        
+        if month_min_single_tp < grand_min_single_tp and month_min_single_tp < 999999.0
+            grand_min_single_tp := month_min_single_tp
+        
+        if month_max_single_sl > grand_max_single_sl
+            grand_max_single_sl := month_max_single_sl
+        
+        float net_pts = month_tp_points - month_sl_points
+        float win_rate = calculateWinRate(month_tp_trades, month_sl_trades)
+        float profit_factor = month_sl_points > 0 ? math.round(month_tp_points / month_sl_points, 2) : (month_tp_points > 0 ? 999.99 : 0.0)
+        float option_pts = math.round(net_pts * option_multiplier)
+        float pnl = math.round(option_pts * lot_size)
+        
+        grand_tp_trades += month_tp_trades
+        grand_sl_trades += month_sl_trades
+        grand_tp_points += month_tp_points
+        grand_sl_points += month_sl_points
+        
+        string month_name_with_year = getMonthNameWithYear(target_month, target_year)
+        
+        // Populate row data
+        table.cell(performanceTable, 0, row, month_name_with_year, text_color=color.white, text_size=size.small)
+        table.cell(performanceTable, 1, row, str.tostring(month_tp_trades), text_color=color.white, text_size=size.small)
+        table.cell(performanceTable, 2, row, str.tostring(month_sl_trades), text_color=color.white, text_size=size.small)
+        table.cell(performanceTable, 3, row, str.tostring(math.round(month_tp_points, 2)), text_color=color.white, text_size=size.small)
+        table.cell(performanceTable, 4, row, str.tostring(math.round(month_sl_points, 2)), text_color=color.white, text_size=size.small)
+        table.cell(performanceTable, 5, row, str.tostring(math.round(net_pts, 2)), text_color=color.white, text_size=size.small, 
+             bgcolor=net_pts >= 0 ? color.new(color.green, 80) : color.new(color.red, 80))
+        table.cell(performanceTable, 6, row, str.tostring(win_rate) + "%", text_color=color.white, text_size=size.small)
+        table.cell(performanceTable, 7, row, str.tostring(profit_factor), text_color=color.white, text_size=size.small)
+        table.cell(performanceTable, 8, row, str.tostring(pnl), text_color=color.white, text_size=size.small)
+        table.cell(performanceTable, 9, row, str.tostring(month_max_sl_streak), text_color=color.white, text_size=size.small)
+        
+        table.cell(performanceTable, 10, row, 
+             month_min_single_tp < 999999.0 ? str.tostring(math.round(month_min_single_tp, 2)) : "-", 
+             text_color=color.white, text_size=size.small, 
+             bgcolor=month_min_single_tp < 999999.0 ? color.new(color.green, 85) : na)
+        
+        table.cell(performanceTable, 11, row, 
+             month_max_single_sl > 0 ? str.tostring(math.round(month_max_single_sl, 2)) : "-", 
+             text_color=color.white, text_size=size.small, 
+             bgcolor=month_max_single_sl > 0 ? color.new(color.red, 85) : na)
+        
+        color days_bgcolor = month_max_trade_duration_days > 7 ? color.new(color.red, 70) : color.new(color.orange, 85)
+        table.cell(performanceTable, 12, row, 
+             month_max_trade_duration_days > 0 ? str.tostring(month_max_trade_duration_days) : "-", 
+             text_color=color.white, text_size=size.small, 
+             bgcolor=month_max_trade_duration_days > 0 ? days_bgcolor : na)
+    
+    float grand_net_pts = grand_tp_points - grand_sl_points
+    float grand_win_rate = calculateWinRate(grand_tp_trades, grand_sl_trades)
+    float grand_profit_factor = grand_sl_points > 0 ? math.round(grand_tp_points / grand_sl_points, 2) : (grand_tp_points > 0 ? 999.99 : 0.0)
+    float grand_option_pts = math.round(grand_net_pts * option_multiplier)
+    float grand_pnl = math.round(grand_option_pts * lot_size)
+    
+    int total_row = performance_months + 1
+    
+    // TOTAL row
+    table.cell(performanceTable, 0, total_row, 'TOTAL', text_color=color.white, text_size=size.small, bgcolor=color.new(color.purple, 60))
+    table.cell(performanceTable, 1, total_row, str.tostring(grand_tp_trades), text_color=color.white, text_size=size.small, bgcolor=color.new(color.purple, 60))
+    table.cell(performanceTable, 2, total_row, str.tostring(grand_sl_trades), text_color=color.white, text_size=size.small, bgcolor=color.new(color.purple, 60))
+    table.cell(performanceTable, 3, total_row, str.tostring(math.round(grand_tp_points, 2)), text_color=color.white, text_size=size.small, bgcolor=color.new(color.purple, 60))
+    table.cell(performanceTable, 4, total_row, str.tostring(math.round(grand_sl_points, 2)), text_color=color.white, text_size=size.small, bgcolor=color.new(color.purple, 60))
+    table.cell(performanceTable, 5, total_row, str.tostring(math.round(grand_net_pts, 2)), text_color=color.white, text_size=size.small, bgcolor=color.new(color.purple, 60))
+    table.cell(performanceTable, 6, total_row, str.tostring(grand_win_rate) + "%", text_color=color.white, text_size=size.small, bgcolor=color.new(color.purple, 60))
+    table.cell(performanceTable, 7, total_row, str.tostring(grand_profit_factor), text_color=color.white, text_size=size.small, bgcolor=color.new(color.purple, 60))
+    table.cell(performanceTable, 8, total_row, str.tostring(grand_pnl), text_color=color.white, text_size=size.small, bgcolor=color.new(color.purple, 60))
+    table.cell(performanceTable, 9, total_row, "-", text_color=color.white, text_size=size.small, bgcolor=color.new(color.purple, 60))
+    
+    table.cell(performanceTable, 10, total_row, 
+         grand_min_single_tp < 999999.0 ? str.tostring(math.round(grand_min_single_tp, 2)) : "-", 
+         text_color=color.white, text_size=size.small, bgcolor=color.new(color.purple, 60))
+    
+    table.cell(performanceTable, 11, total_row, str.tostring(math.round(grand_max_single_sl, 2)), 
+         text_color=color.white, text_size=size.small, bgcolor=color.new(color.purple, 60))
+    
+    color grand_days_bgcolor = grand_max_trade_duration_days > 7 ? color.new(color.red, 40) : color.new(color.purple, 60)
+    table.cell(performanceTable, 12, total_row, str.tostring(grand_max_trade_duration_days), 
+         text_color=color.white, text_size=size.small, bgcolor=grand_days_bgcolor)
+
+// ===== ALERT CONDITIONS =====
+
+alertcondition(ALERT_BUY_FIRED and TRADE_ACTIVE and TRADE_DIR == 1 and barstate.isconfirmed, title="🟢 BUY Entry Signal", message="🟢 BUY ENTRY | {{ticker}} | Price: {{close}} | Check chart for levels")
+
+alertcondition(ALERT_SELL_FIRED and TRADE_ACTIVE and TRADE_DIR == -1 and barstate.isconfirmed, title="🔴 SELL Entry Signal", message="🔴 SELL ENTRY | {{ticker}} | Price: {{close}} | Check chart for levels")
+
+alertcondition(ALERT_TP1_FIRED and TRADE_ACTIVE and barstate.isconfirmed, title="✅ TP1 Hit", message="✅ TP1 HIT! | {{ticker}} | Price: {{close}}")
+
+alertcondition(ALERT_TP2_FIRED and TRADE_ACTIVE and barstate.isconfirmed, title="✅ TP2 Hit", message="✅ TP2 HIT! | {{ticker}} | Price: {{close}}")
+
+alertcondition(ALERT_TP3_FIRED and TRADE_ACTIVE and barstate.isconfirmed, title="✅ TP3 Hit", message="✅ TP3 HIT! | {{ticker}} | Price: {{close}}")
+
+alertcondition(ALERT_TP4_FIRED and TRADE_ACTIVE and barstate.isconfirmed, title="✅ TP4 Hit", message="✅ TP4 HIT! | {{ticker}} | Price: {{close}}")
+
+alertcondition(ALERT_SL_FIRED and not TRADE_ACTIVE and barstate.isconfirmed, title="❌ Stop Loss Hit", message="❌ STOP LOSS HIT! | {{ticker}} | Exit: {{close}} | Trade Closed")
+
+alertcondition(ALERT_TSL_FIRED and not TRADE_ACTIVE and barstate.isconfirmed, title="🔶 Trailing Stop Hit", message="🔶 TRAILING STOP HIT! | {{ticker}} | Exit: {{close}} | Profit Protected")
+
+alertcondition(is_eod_exit_time and TRADE_ACTIVE and barstate.isconfirmed, title="⏰ EOD Exit Triggered", message="⏰ END OF DAY EXIT | {{ticker}} | Closing Position")
+
+alertcondition(not TRADE_ACTIVE and (ALERT_BUY_FIRED[1] or ALERT_SELL_FIRED[1]) and barstate.isconfirmed, title="🔔 Trade Closed", message="🔔 TRADE CLOSED | {{ticker}} | Exit: {{close}} | Check chart")
